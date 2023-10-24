@@ -1,0 +1,984 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import functools
+import json
+import os
+import re
+import subprocess
+import sys
+from html.parser import HTMLParser
+
+# Author: Eagu Kim
+# Inspired by megaclisas-status
+# @see https://raw.githubusercontent.com/eLvErDe/hwraid/master/wrapper-scripts/megaclisas-status
+
+
+words = {
+    '': '',
+    '-': '',
+    'None': '',
+    #
+    'D': 'Down',
+    'U': 'Up',
+    "Disk's Default": 'Default',
+    'Dgrd': 'Degraded',
+    'DHS': 'Dedicated Hot Spare',
+    'GHS': 'Global Hot Spare',
+    'Offln': 'Offline',
+    'Onln': 'Online',
+    'Optl': 'Optimal',
+    'Rbld': 'Rebuild',
+    'Sntze': 'Sanitize',
+    'UBad': 'Unconfigured Bad',
+    'UGood': 'Unconfigured Good',
+}
+
+storcli_path = None
+colorize = True
+cdata = None
+edata = None
+vdata = None
+sdata = None
+time_difference_data = None
+slot_to_topology_data = None
+slot_to_virtual_disk_data = None
+controller_schedule_data = None
+
+
+###############################################################################
+# API calls
+###############################################################################
+
+
+def storcli_call(command, text=False):
+    suffix = ' nolog' if text else ' J nolog'
+    proc = subprocess.Popen([storcli_path + ' ' + command + suffix], stdout=subprocess.PIPE, shell=True)
+    (stdout, stderr) = proc.communicate()
+    return stdout.decode('utf-8') if text else json.loads(stdout)
+
+
+def controller_count_json():
+    return storcli_call('show ctrlcount')
+
+
+def getcid(controller):
+    cid = _get(controller, 'Command Status.Controller', None)
+    return '' if cid == None else f'/c{cid}'
+
+
+def controller_json():
+    global cdata
+    if not cdata: cdata = storcli_call('/call show all')
+    return cdata
+
+
+def time_difference_json():
+    global time_difference_data
+    if not time_difference_data:
+        time_difference_data = {}
+        cdata = controller_json()
+        for controller in _get(cdata, 'Controllers', []):
+            cid = getcid(controller)
+            controller_clock = strstrip(_get(controller, 'Response Data.Basics.Current Controller Date/Time', None))
+            system_clock = strstrip(_get(controller, 'Response Data.Basics.Current System Date/time', None))
+            diff = None
+            if controller_clock is not None and controller_clock != 'None' and system_clock is not None and system_clock != 'None':
+                diff = parse_datetime(system_clock) - parse_datetime(controller_clock)
+            time_difference_data[cid] = diff
+    return time_difference_data
+
+
+def slot_to_topology_json():
+    global slot_to_topology_data
+    if not slot_to_topology_data:
+        slot_to_topology_data = {}
+        cdata = controller_json()
+        for controller in _get(cdata, 'Controllers', []):
+            cid = getcid(controller)
+            for e in _get(controller, 'Response Data.TOPOLOGY', {}):
+                try:
+                    (eid, sid) = e['EID:Slot'].split(':')
+                    key = f'{cid}/e{eid}/s{sid}'
+                    value = f'dg={e["DG"]} array={e["Arr"]} row={e["Row"]}'
+                    slot_to_topology_data[key] = value
+                except:
+                    continue
+    return slot_to_topology_data
+
+
+def controller_schedule_json():
+    global controller_schedule_data
+    if not controller_schedule_data: controller_schedule_data = storcli_call('/call show cc pr')
+    return controller_schedule_data
+
+
+def enclosure_json():
+    global edata
+    if not edata: edata = storcli_call('/call/eall show all')
+    return edata
+
+
+def virtual_disk_json():
+    global vdata
+    global slot_to_virtual_disk_data
+    if not vdata: vdata = storcli_call('/call/vall show all')
+    return vdata
+
+
+def slot_to_virtual_disk_json():
+    global slot_to_virtual_disk_data
+    if not slot_to_virtual_disk_data:
+        slot_to_virtual_disk_data = {}
+        vdata = virtual_disk_json()
+        for controller in _get(vdata, 'Controllers', []):
+            cid = getcid(controller)
+            for k, v in _get(controller, 'Response Data', {}).items():
+                if re.match('^/c\d+/v\d+$', k):
+                    vid = k
+                elif re.match('^PDs for VD \d+$', k):
+                    for p in v:
+                        (eid, sid) = p['EID:Slt'].split(':')
+                        key = f'{cid}/e{eid}/s{sid}'
+                        slot_to_virtual_disk_data[key] = vid
+    return slot_to_virtual_disk_data
+
+
+def slot_json():
+    global sdata
+    if not sdata: sdata = storcli_call('/call/eall/sall show all')
+    return sdata
+
+
+def consistency_check_json(vid):
+    return storcli_call(f'{vid} show cc')
+
+
+def event_text(cid, filters=None, type=None):
+    filters = '' if not filters else f' filter={filters}'
+    type = '' if not type else f' type="{type}"'
+    return storcli_call(f'{cid} show events' + type + filters, True)
+
+
+###############################################################################
+# Color functions
+###############################################################################
+
+
+ansi_color_code = {
+    'text': '',                   #
+    'info': '\033[32m',           # foreground: green
+    'warn': '\033[33m',           # foreground: yellow
+    'error': '\033[31m',          # foreground: red
+    'fatal': '\033[37m\033[41m',  # foreground: white, background: red
+}
+
+
+def mark_text(text, tag=None): return text if not tag else f'<{tag}>{text}</{tag}>'
+
+
+def color_text(text, tag=None):
+    lower_tag = tag.lower()
+    if (not colorize) or (lower_tag not in ansi_color_code): return text
+    return f'\033[1m{ansi_color_code[lower_tag]}{text}\033[0m'
+
+
+class ColorTagParser(HTMLParser):
+    '''
+    There are two cases on which this parser cannot handle the input:
+    1. emptry string (e.g. '')
+    2. tags with empty string (e.g. <blah></blah>)
+
+    To handle the first case, feed is overriden.
+    To handle the second case, self.curr_data is defined and checked in handle_endtag.
+    '''
+    def __init__(self):
+        super().__init__()
+        self.parsed = []
+        self.curr_tag = None
+        self.curr_data = None
+
+    def feed(self, text):
+        super().feed(text)
+        if text == '': self.parsed = [['', None]]
+
+    def handle_starttag(self, tag, attrs):
+        if self.curr_tag is not None:
+            print('Cannot process malformed tags.')
+            sys.exit(1)
+        self.curr_tag = tag
+
+    def handle_data(self, data):
+        self.parsed.append([data, self.curr_tag])
+        self.curr_data = data
+
+    def handle_endtag(self, tag):
+        if self.curr_tag != tag:
+            print('Cannot process malformed tags.')
+            sys.exit(1)
+        if self.curr_data is None:
+            self.parsed.append(['', self.curr_tag])
+        self.curr_tag = None
+        self.curr_data = None
+
+
+def parse_mark_text(text):
+    parser = ColorTagParser()
+    parser.feed(text)
+    return parser.parsed
+
+
+def mark_to_color(text):
+    p = parse_mark_text(text)
+    return functools.reduce(lambda r, e: r + (e[0] if not e[1] else color_text(e[0], e[1])), p, '')
+
+
+def mark_text_len(text):
+    p = parse_mark_text(text)
+    return functools.reduce(lambda r, e: r + len(e[0]), p, 0)
+
+
+def justify_mark_text(text, width, char=' ', just='left'):
+    strtext = str(text)
+    count = width - mark_text_len(strtext)
+    if count == 0: return strtext
+    p = parse_mark_text(strtext)
+    if just == 'left' or just == 'l':
+        if not p[-1][1]: pos = len(strtext)
+        else: pos = (len(strtext) - (len(p[-1][1]) + 3))
+    elif just == 'right' or just == 'r':
+        if not p[0][1]: pos = 0
+        else: pos = len(p[0][1]) + 2
+    return strtext[0:pos] + (char * count) + strtext[pos:]
+
+
+###############################################################################
+# Information processing
+###############################################################################
+
+
+def strstrip(s): return str(s).strip()
+def wordmap(s): return s if s not in words else words[s]
+
+
+def parse_datetime(s):
+    for format in ['%m/%d/%Y, %H:%M:%S', '%m/%d/%Y %H:%M:%S', '%c']:
+        try: return datetime.datetime.strptime(s, format)
+        except: continue
+    return s
+
+
+def parse_to_system_datetime(cid, s):
+    time_difference_data = time_difference_json()
+    if cid not in time_difference_data: return s
+    return parse_datetime(s) + time_difference_data[cid]
+
+def format_datetime(s, fine_resolution=True):
+    if not fine_resolution: return s.strftime('%a %Y-%m-%d %H')
+    return s.strftime('%a %Y-%m-%d %H:%M:%S')
+
+
+def parse_duration(s):
+    match = re.match(r'\s*((?P<days>-?\d+) day[s]?)?\s*((?P<hours>-?\d+) hour[s]?)?\s*((?P<minutes>-?\d+) minute[s]?)?\s*', s, re.IGNORECASE)
+    if match: return { **{ 'days': None, 'hours': 0, 'minutes': 0, 'seconds': 0 }, **{ k: int(v) for k, v in match.groupdict().items() if v }}
+
+
+def format_duration(s):
+    return ('' if not s['days'] else f'{s["days"]}d ') + f'{str(s["hours"]).rjust(2, "0")}:{str(s["minutes"]).rjust(2, "0")}:{str(s["seconds"]).rjust(2, "0")}'
+
+
+def _get(o, k, d=''):
+    # Inspired by lodash _.get()
+    r = o
+    for key in k.split('.'):
+        try: r = r[key]
+        except:
+            if not (isinstance(r, list) or isinstance(r, tuple)): return d
+            try:
+                if len(r) >= int(key): r = r[int(key)]
+                else: return d
+            except: return d
+    return r
+
+
+def convert_to_bytes(size_string):
+    # @see https://stackoverflow.com/a/44307814
+    short_suffixes = [f'{e}b' for e in ['', 'k', 'm', 'g', 't', 'p', 'e', 'z']]
+    long_suffixes = [f'{e}byte' for e in ['', 'kilo', 'mega', 'giga', 'tera', 'peta', 'exa', 'zetta', 'yotta']]
+    multipliers = {**{f'{i}': 1024 ** p for p, i in enumerate(short_suffixes)}, **{f'{i}': 1024 ** p for p, i in enumerate(long_suffixes)}}
+    size_regex = re.compile("\s*(\d*[\.]?\d*)\s*({})s?\s*".format('|'.join(short_suffixes + long_suffixes)), re.IGNORECASE)
+    def subst(m): return str(float(m.group(1)) * multipliers[m.group(2).lower()])
+
+    return float(size_regex.sub(subst, size_string))
+
+
+def get_controller_info():
+    fields = ['Cid', 'Controller (serial, firmware)', 'RAM', 'Tmp', 'BBU', 'Alarm', 'Controller clock', 'System clock']
+    aligns = ['l', 'l', 'r', 'r', 'l', 'l', 'l', 'l']
+    values = []
+
+    cdata = controller_json()
+    for controller in _get(cdata, 'Controllers', []):
+        cid = getcid(controller)
+        r = _get(controller, 'Response Data', {})
+        controller_model = strstrip(_get(r, 'Basics.Model'))
+        controller_serial_number = strstrip(_get(r, 'Basics.Serial Number'))
+        controller_firmware_version = strstrip(_get(r, 'Version.Firmware Package Build'))
+        controller_clock = strstrip(_get(r, 'Basics.Current Controller Date/Time'))
+        if controller_clock != '': controller_clock = format_datetime(parse_datetime(controller_clock))
+        system_clock = strstrip(_get(r, 'Basics.Current System Date/time'))
+        if system_clock != '': system_clock = format_datetime(parse_datetime(system_clock))
+        ram = strstrip(_get(r, 'HwCfg.On Board Memory Size'))
+        temperature = strstrip(_get(r, 'HwCfg.Ctrl temperature(Degree Celsius)', strstrip(_get(r, 'HwCfg.ROC temperature(Degree Celsius)'))))
+        if temperature != '': temperature = f'{temperature}C'
+        bbu = strstrip(_get(r, 'HwCfg.BBU'))
+        if bbu == 'Present': bbu = 'Good' if 0 == _get(r, 'Status.BBU Status') else mark_text('Bad', 'error')
+        alarm = strstrip(_get(r, 'HwCfg.Alarm'))
+        if alarm == 'Disable': alarm = 'Disabled'
+        # Colorize
+        if alarm == 'Disabled': alarm = mark_text(alarm, 'warn')
+        #
+        values.append([cid, f'{controller_model} ({controller_serial_number}, {controller_firmware_version})', ram, temperature, bbu, alarm, controller_clock, system_clock])
+
+    values = sorted(values, key=lambda e: e[0])
+    return {'fields': fields, 'aligns': aligns, 'values': values}
+
+
+def get_controller_schedule_info():
+    fields = ['Cid', 'Task', 'Mode', 'Delay', 'Next schedule (system clock)', 'Status', 'Excluded']
+    aligns = ['l', 'l', 'l', 'r', 'l', 'l', 'l']
+    values = []
+
+    time_difference_data = time_difference_json()
+    controller_schedule_data = controller_schedule_json()
+    for controller in _get(controller_schedule_data, 'Controllers', []):
+        cid = getcid(controller)
+        r = _get(controller, 'Response Data.Controller Properties', {})
+        cc = { 'task': 'Consistency Check', 'mode': '', 'delay': '', 'next': '', 'status': '', 'exclusion': '' }
+        pr = { 'task': 'Patrol Read', 'mode': '', 'delay': '', 'next': '', 'status': '', 'exclusion': '' }
+        for e in r:
+            k = _get(e, 'Ctrl_Prop', '')
+            v = strstrip(_get(e, 'Value', ''))
+            if k == '': continue
+            # consistency check
+            elif k == 'CC Operation Mode': cc['mode'] = v
+            elif k == 'CC Execution Delay': cc['delay'] = v
+            elif k == 'CC Next Starttime': cc['next'] = v
+            elif k == 'CC Current State': cc['status'] = v
+            elif k == 'CC Excluded VDs':
+                cc['exclusion'] = wordmap(v)
+                if cc['exclusion'] != '':
+                    cc['exclusion'] = ', '.join([f'{cid}/v{e}' for e in cc['exclusion'].split(',')])
+            # patrol read
+            elif k == 'PR Mode': pr['mode'] = 'Disabled' if v == 'Disable' else v
+            elif k == 'PR Execution Delay': pr['delay'] = v
+            elif k == 'PR Next Start time': pr['next'] = v
+            elif k == 'PR Current State':
+                pr['status'] = v
+                # @see https://techdocs.broadcom.com/content/dam/broadcom/techdocs/data-center-solutions/tools/generated-pdfs/StorCLI-12Gbs-MegaRAID-Tri-Mode.pdf
+                if v.startswith('Active'):
+                    (s, d) = v.split(' ')
+                    pr['status'] = f'{s} ({"no disks" if d == "0" else "1 disk" if d == "1" else d + " disks"} done)'
+            elif k == 'PR Excluded VDs':
+                pr['exclusion'] = wordmap(v)
+                if pr['exclusion'] != '':
+                    pr['exclusion'] = ', '.join([f'{cid}/v{e}' for e in pr['exclusion'].split(',')])
+        if cc['next'] != '' and time_difference_data[cid] is not None:
+            cc['next'] = format_datetime(parse_datetime(cc['next'])) + ' (' + format_datetime(parse_to_system_datetime(cid, cc['next'])) + ')'
+        if pr['next'] != '' and time_difference_data[cid] is not None:
+            pr['next'] = format_datetime(parse_datetime(pr['next'])) + ' (' + format_datetime(parse_to_system_datetime(cid, pr['next'])) + ')'
+        # Colorize
+        if cc['status'].startswith('Active'): cc['status'] = mark_text(cc['status'], 'info')
+        if pr['status'].startswith('Active'): pr['status'] = mark_text(pr['status'], 'info')
+        #
+        values.append([cid] + list(cc.values()))
+        values.append([cid] + list(pr.values()))
+
+    values = sorted(values, key=lambda e: e[0])
+    return {'fields': fields, 'aligns': aligns, 'values': values}
+
+
+def get_enclosure_info():
+    fields = ['Eid', 'Enclosure (product, rev)', 'Type', 'Status', 'Slt', 'Dsk']
+    aligns = ['l', 'l', 'l', 'l', 'r', 'r']
+    values = []
+
+    edata = enclosure_json()
+    for controller in _get(edata, 'Controllers', []):
+        r = _get(controller, 'Response Data', {})
+        for k, v in r.items():
+            if re.match('^Enclosure /c\d+/e\d+\s*$', k):
+                eid = k.split(' ')[1]
+                vendor = strstrip(_get(v, 'Inquiry Data.Vendor Identification'))
+                product = strstrip(_get(v, 'Inquiry Data.Product Identification'))
+                revision = strstrip(_get(v, 'Inquiry Data.Product Revision Level'))
+                device = strstrip(_get(v, 'Information.Device Type'))
+                status = strstrip(_get(v, 'Properties.0.State'))
+                slots = _get(v, 'Properties.0.Slots')
+                disks = _get(v, 'Properties.0.PD')
+                # Colorize
+                #
+                values.append([eid, f'{vendor} ({product}, {revision})', device, status, slots, disks])
+
+    values = sorted(values, key=lambda e: e[0])
+    return {'fields': fields, 'aligns': aligns, 'values': values}
+
+
+def get_virtual_disk_info():
+    fields = ['Vid', 'Type', 'Size', 'Dsk', 'Strpsz', 'CacheFlg', 'DskCache', 'Status', 'CacheCade', 'Path', 'Name', 'Active task']
+    aligns = ['l', 'l', 'r', 'r', 'r', 'l', 'l', 'l', 'l', 'l', 'l', 'l']
+    values = []
+
+    vdata = virtual_disk_json()
+    for controller in _get(vdata, 'Controllers', []):
+        r = _get(controller, 'Response Data', {})
+        for k, v in r.items():
+            if re.match('^/c\d+/v\d+$', k):
+                vid = k
+                raid_type = strstrip(_get(v, '0.TYPE'))
+                size = strstrip(_get(v, '0.Size'))
+                cache_flags = strstrip(_get(v, '0.Cache'))
+                cache_flags = re.sub('R', 'R/', re.sub('C', '/C', re.sub('D', '/D', cache_flags)))
+                status = wordmap(strstrip(_get(v, '0.State')))
+                name = strstrip(_get(v, '0.Name'))
+                cachecade = wordmap(strstrip(_get(v, '0.Cac')))
+            elif re.match('^PDs for VD \d+$', k):
+                disks = len(v)
+            elif re.match('^VD\d+ Properties$', k):
+                strip_size = strstrip(_get(v, 'Strip Size'))
+                disk_cache = wordmap(strstrip(_get(v, 'Disk Cache Policy')))
+                path = wordmap(strstrip(_get(v, 'OS Drive Name')))
+                operations = wordmap(strstrip(_get(v, 'Active Operations')))
+                time_left = None
+                if operations.startswith('Consistency Check'):
+                    cc = consistency_check_json(vid)
+                    time_left = strstrip(_get(cc, 'Controllers.0.Response Data.VD Operation Status.0.Estimated Time Left', None))
+                    if time_left:
+                        time_left = format_duration(parse_duration(time_left))
+                        operations = operations + ', ' + time_left + ' left'
+                elif operations == '':
+                    cc = consistency_check_json(vid)
+                    realop = strstrip(_get(cc, 'Controllers.0.Response Data.VD Operation Status.0.Status', None))
+                    if realop == 'Paused': operations = 'Consistency Check (Paused)'
+                # Colorize
+                if status == 'Degraded': status = mark_text(status, 'warn')
+                operations = mark_text(operations, 'warn') if operations == 'Consistency Check (Paused)' else mark_text(operations, 'info')
+                #
+                values.append([vid, raid_type, size, disks, strip_size, cache_flags, disk_cache, status, cachecade, path, name, operations])
+
+    values = sorted(values, key=lambda e: e[0])
+    return {'fields': fields, 'aligns': aligns, 'values': values}
+
+
+def get_physical_disk_info(configured=None):
+    fields = ['Vid', 'Sid', 'Disk (serial, firmware)', 'Intf', 'Med', 'Size', 'Status', 'Spun', 'DskSpeed', 'LnkSpeed', 'Tmp', 'Did', 'Prd', 'Topology']
+    aligns = ['l', 'l', 'l', 'l', 'l', 'r', 'l', 'l', 'r', 'r', 'r', 'r', 'r', 'l']
+    values = []
+
+    slot_to_virtual_disk_data = slot_to_virtual_disk_json()
+    slot_to_topology_data = slot_to_topology_json()
+    sdata = slot_json()
+    for controller in _get(sdata, 'Controllers', []):
+        r = _get(controller, 'Response Data', {})
+        for k, v in r.items():
+            if re.match('^Drive /c\d+/e\d+/s\d+$', k):
+                sid = k[6:]
+                vid = '' if sid not in slot_to_virtual_disk_data else slot_to_virtual_disk_data[sid]
+                interface = strstrip(_get(v, '0.Intf'))
+                media = strstrip(_get(v, '0.Med'))
+                disk_model = re.sub('\s\s+', ' ', strstrip(_get(v, '0.Model')))
+                size = strstrip(_get(v, '0.Size'))
+                status = wordmap(strstrip(_get(v, '0.State')))
+                spun = wordmap(strstrip(_get(v, '0.Sp')))
+                did = _get(v, '0.DID')
+            elif re.match('^Drive /c\d+/e\d+/s\d+ - Detailed Information$', k):
+                disk_manufacturer = strstrip(_get(v, f'Drive {sid} Device attributes.Manufacturer Id'))
+                disk_manufacturer = '' if disk_manufacturer == 'ATA' else f'{disk_manufacturer} '
+                disk_serial_number = strstrip(_get(v, f'Drive {sid} Device attributes.SN'))
+                disk_firmware_version = strstrip(_get(v, f'Drive {sid} Device attributes.Firmware Revision'))
+                speed = strstrip(_get(v, f'Drive {sid} Device attributes.Device Speed'))
+                link_speed = strstrip(_get(v, f'Drive {sid} Device attributes.Link Speed'))
+                temperature = strstrip(_get(v, f'Drive {sid} State.Drive Temperature')).split(' ')[0]
+                predictive_failure = _get(v, f'Drive {sid} State.Predictive Failure Count')
+                topology = '' if sid not in slot_to_topology_data else slot_to_topology_data[sid]
+                # Colorize
+                if status == 'Rebuild': status = mark_text(status, 'warn')
+                elif status == 'Unconfigured Bad': status = mark_text(status, 'warn')
+                if predictive_failure >= 1: predictive_failure = mark_text(predictive_failure, 'info')
+                #
+                if configured is True and vid == '': continue
+                if configured is False and vid != '': continue
+                #
+                values.append([vid, sid, f'{disk_manufacturer}{disk_model} ({disk_serial_number}, {disk_firmware_version})', interface, media, size, status, spun, speed, link_speed, temperature, did, predictive_failure, topology])
+
+    if configured is False:
+        # Take out Topology field
+        fields.pop(13)
+        aligns.pop(13)
+        [v.pop(13) for v in values]
+        # Take out Vid field
+        fields.pop(0)
+        aligns.pop(0)
+        [v.pop(0) for v in values]
+    if configured is True:
+        values = sorted(values, key=lambda e: e[0])
+    return {'fields': fields, 'aligns': aligns, 'values': values}
+
+
+###############################################################################
+# Sanity check
+###############################################################################
+
+
+checklist_dict = {
+    'W01': {
+        'text': 'BBU is either absent or good on {cid}.',
+        'action': ['sudo {storcli_path} {cid}/bbu show status', 'Replace BBU on {cid} if needed.'],
+    },
+    'W02': {
+        'text': 'Auto rebuild option is on in {cid}.',
+        'action': ['sudo {storcli_path} {cid} set autorebuild=on']
+    },
+    'W03': {
+        'text': 'Alarm is either absent or on in {cid}.',
+        'action': ['sudo {storcli_path} {cid} set alarm=on']
+    },
+    'W04': {
+        'text': 'No two tasks are schueduled to run at the same time on {cid}.',
+        'action': ['sudo {storcli_path} {cid} set [task] starttime="yyyy/mm/dd hh"']
+    },
+    'W05': {
+        'text': 'Consistency check is recommended not to run too often (less than 30 days) on {cid}.',
+        'action': ['sudo {storcli_path} {cid} set consistencycheck delay=720']
+    },
+    'W06': {
+        'text': 'Patrol read is recommended not to run too often (less than a week) on {cid}.',
+        'action': ['sudo {storcli_path} {cid} set patroread delay=168']
+    },
+    'W07': {
+        'text': 'Consistency check is recommended not to run on a large volume (over 100 TB) on {cid}.',
+        'action': [
+            mark_text('WARNING', 'error') + ': The following command sequence will DISABLE consistency check FOR ALL virtual disks on {cid}.',
+            'sudo {storcli_path} {cid}/vall stop consistencycheck',
+            'sudo {storcli_path} {cid} set consistencycheck=off',
+        ]
+    },
+    'W08': {
+        'text': 'Patrol read is recommended not to run on a large volume (over 100 TB) on {cid}.',
+        'action': [
+            mark_text('WARNING', 'error') + ': The following command sequence will DISABLE Patrol read FOR ALL virtual disks on {cid}.',
+            'sudo {storcli_path} {cid}/vall stop patrolread',
+            'sudo {storcli_path} {cid} set patrolread=off',
+        ]
+    },
+    'I01': {
+        'text': 'Multiple virtual disks are recommended to be named.',
+        'action': ['sudo {storcli_path} /cx/vx set name="[name]"']
+    },
+    'I02': {
+        'text': 'Write-back is recommended for write cache policy on {vid} if the host is connected to a failure-free power source.',
+        'action': [
+            mark_text('WARNING', 'error') + ': Do NOT run the following command if the host is NOT connected to a failure-free power source.',
+            'sudo {storcli_path} {vid} set wrcache=wb|awb',
+        ]
+    },
+}
+
+
+def sanity_check():
+    checklist = []
+
+    cdata = controller_json()
+    for controller in _get(cdata, 'Controllers', []):
+        cid = getcid(controller)
+        r = _get(controller, 'Response Data', {})
+        auto_rebuild = strstrip(_get(r, 'Policies.Auto Rebuild', 'On'))
+        alarm = strstrip(_get(r, 'HwCfg.Alarm', 'On'))
+        if alarm == 'Disable': alarm = 'Disabled'
+        bbu = strstrip(_get(r, 'HwCfg.BBU'))
+        if bbu == 'Present': bbu = _get(r, 'Status.BBU Status')
+
+        # W01
+        passed = not (bbu != 'Absent' and bbu != 0 and bbu != '')
+        checklist.append({ 'key': 'W01', 'pass': passed, 'params': { 'cid': cid } })
+
+        # W02
+        passed = not (auto_rebuild != 'On')
+        checklist.append({ 'key': 'W02', 'pass': passed, 'params': { 'cid': cid } })
+
+        # W03
+        passed = not (alarm == 'Disabled')
+        checklist.append({ 'key': 'W03', 'pass': passed, 'params': { 'cid': cid } })
+
+    controller_schedule_data = controller_schedule_json()
+    schedules = {}
+    for controller in _get(controller_schedule_data, 'Controllers', []):
+        cid = getcid(controller)
+        r = _get(controller, 'Response Data.Controller Properties', {})
+        (cc_mode, cc_delay, cc_next, pr_mode, pr_delay, pr_next) = (None,) * 6
+        for e in r:
+            k = _get(e, 'Ctrl_Prop', '')
+            v = strstrip(_get(e, 'Value', ''))
+            if k == '': continue
+            elif k == 'CC Operation Mode': cc_mode = v
+            elif k == 'CC Execution Delay': cc_delay = int(v.split(' ')[0])
+            elif k == 'CC Next Starttime': cc_next = v
+            elif k == 'PR Mode': pr_mode = 'Disabled' if v == 'Disable' else v
+            elif k == 'PR Execution Delay': pr_delay = int(v.split(' ')[0])
+            elif k == 'PR Next Start time': pr_next = v
+        schedules[cid] = { 'cc_mode': cc_mode, 'cc_next': cc_next, 'pr_mode': pr_mode, 'pr_next': pr_next }
+
+        # W04
+        passed = not (cc_mode is not None and cc_mode != 'Disabled' and pr_mode is not None and pr_mode != 'Disabled' and cc_next != None and cc_next == pr_next)
+        checklist.append({ 'key': 'W04', 'pass': passed, 'params': { 'cid': cid } })
+
+        # W05
+        passed = not (cc_mode is not None and cc_mode != 'Disabled' and cc_delay is not None and cc_delay < 720)
+        checklist.append({ 'key': 'W05', 'pass': passed, 'params': { 'cid': cid } })
+
+        # W06
+        passed = not (pr_mode is not None and pr_mode != 'Disabled' and pr_delay is not None and pr_delay < 168)
+        checklist.append({ 'key': 'W06', 'pass': passed, 'params': { 'cid': cid } })
+
+    vdata = virtual_disk_json()
+    virtual_disk_names = []
+    for controller in _get(vdata, 'Controllers', []):
+        cid = getcid(controller)
+        r = _get(controller, 'Response Data', {})
+        large_volumes = {}
+        for k, v in r.items():
+            if re.match('^/c\d+/v\d+$', k):
+                vid = k
+                size = strstrip(_get(v, '0.Size'))
+                name = strstrip(_get(v, '0.Name'))
+                virtual_disk_names.append(name)
+                if convert_to_bytes(size) > 100 * (1024 ** 4):  # more than 100 TB
+                    large_volumes[cid] = True
+                cache_flags = strstrip(_get(v, '0.Cache'))
+                cache_flags = re.sub('R', 'R/', re.sub('C', '/C', re.sub('D', '/D', cache_flags)))
+                write_policy = cache_flags.split('/')[1]
+
+                # I02
+                passed = True if write_policy == 'AWB' or write_policy == 'WB' else None
+                checklist.append({ 'key': 'I02', 'pass': passed, 'params': { 'vid': vid } })
+
+        # W07
+        passed = not (cid in large_volumes and schedules[cid]['cc_mode'] is not None and schedules[cid]['cc_mode'] != 'Disabled')
+        checklist.append({ 'key': 'W07', 'pass': passed, 'params': { 'cid': cid } })
+
+        # W08
+        passed = not (cid in large_volumes and schedules[cid]['pr_mode'] is not None and schedules[cid]['pr_mode'] != 'Disabled')
+        checklist.append({ 'key': 'W08', 'pass': passed, 'params': { 'cid': cid } })
+
+    # I01
+    passed = not (len(virtual_disk_names) >= 2 and len(list(filter(lambda e: e is None or e == '', virtual_disk_names))) >= 1)
+    checklist.append({ 'key': 'I01', 'pass': passed })
+
+    checklist = sorted(checklist, key=lambda e: e['key'])
+    return checklist
+
+
+###############################################################################
+# Predictive failure
+###############################################################################
+
+
+# TODO: Find the equivalent command for this: megacli64 -AdpAllInfo -aALL | grep "Critical Disk"
+# TODO: Find the equivalent command for this: megacli64 -AdpAllInfo -aALL | grep "Failed Disk"
+
+def get_predictive_failure():
+    predictive_failure_counts = {}
+
+    sdata = slot_json()
+    for controller in _get(sdata, 'Controllers', []):
+        r = _get(controller, 'Response Data', {})
+        for k, v in r.items():
+            if re.match('^Drive /c\d+/e\d+/s\d+$', k):
+                sid = k[6:]
+            elif re.match('^Drive /c\d+/e\d+/s\d+ - Detailed Information$', k):
+                predictive_failure = _get(v, f'Drive {sid} State.Predictive Failure Count')
+                if predictive_failure == 0: continue
+                predictive_failure_counts[sid] = predictive_failure
+
+    return predictive_failure_counts
+
+
+###############################################################################
+# Event logs
+###############################################################################
+
+
+severity = {
+    '-1': 'progress',  # Progress message. No user action is necessary.
+    '0': 'info',       # Informational message. No user action is necessary.
+    '1': 'warning',    # Some component might be close to a failure point.
+    '2': 'critical',   # A component has failed, but the system has not lost data.
+    '3': 'fatal',      # A component has failed, and data loss has occurred or will occur.
+    '4': 'fault',      # The I/O Unit faulted due to a catastrophic error.
+}
+
+
+def get_event_logs(cid, event_filters, event_type):
+    ignores = ['', '===========', 'None']
+    event_terminator = 'CLI Version ='
+
+    event_data = event_text(cid, event_filters, event_type)
+
+    events = []
+    entry = None
+    handling_event_data = False
+
+    for line in event_data.splitlines():
+        line = line.strip()
+        if line in ignores: continue
+        if line.startswith(event_terminator): break
+
+        try:
+            split = line.split(':')
+            (key, v) = (split[0], ':'.join(split[1:]).strip())
+        except: (key, v) = [line, '']
+
+        if key == 'seqNum': # next event starts
+            if entry is not None: events.append(entry)  # save previous entry
+            entry = { 'seq_num': None, 'time': None, 'system_clock': None, 'code': None, 'level': None, 'locale': None, 'description': None, 'data': [] }
+            handling_event_data = False
+            entry['seq_num'] = v
+        elif key == 'Time':
+            entry['time'] = format_datetime(parse_datetime(v))
+            entry['system_clock'] = format_datetime(parse_to_system_datetime(cid, v))
+        elif key == 'Seconds since last reboot':
+            entry['time'] = f'{v} secs (since reboot)'
+            entry['system_clock'] = entry['time']
+        elif key == 'Code': entry['code'] = v
+        elif key == 'Class':
+            s = _get(severity, v, f'unknown ({v})')
+            # @see https://techdocs.broadcom.com/content/dam/broadcom/techdocs/data-center-solutions/tools/generated-pdfs/12Gbs-MegaRAID-Tri-Mode-Software.pdf
+            if s == 'progress': s = mark_text(s, 'text')
+            elif s == 'info': s = mark_text(s, 'info')
+            elif s == 'warning': s = mark_text(s, 'warn')
+            elif s == 'critical': s = mark_text(s, 'error')
+            elif s == 'fatal': s = mark_text(s, 'fatal')
+            elif s == 'fault': s = mark_text(s, 'fatal')
+            else: s = mark_text(s, 'fatal')
+            entry['severity'] = s.upper()
+        elif key == 'Locale': entry['locale'] = v
+        elif key == 'Event Description': entry['description'] = v if len(v) <= 80 else f'{v[:77]}...'
+        elif key == 'Event Data': handling_event_data = True
+        elif handling_event_data: entry['data'].append(line)
+    if entry is not None: events.append(entry)  # save previous entry
+
+    #print(json.dumps(events, indent=2))
+
+    fields = ['Cid', 'SeqNum', 'Time (system clock)', 'Severity', 'Description', 'Data', 'Code', 'Locl', 'Time (controller clock)']
+    aligns = ['l', 'l', 'r', 'l', 'l', 'l', 'l', 'l', 'r']
+    values = [[cid, e['seq_num'], e['system_clock'], e['severity'], e['description'], 'More' if len(e['data']) else '', e['code'], e['locale'], e['time']] for e in events]
+
+    # Take out Locl field
+    fields.pop(7)
+    aligns.pop(7)
+    [v.pop(7) for v in values]
+    # Take out Code field
+    fields.pop(6)
+    aligns.pop(6)
+    [v.pop(6) for v in values]
+    return {'fields': fields, 'aligns': aligns, 'values': values}
+
+
+###############################################################################
+# Data formatters
+###############################################################################
+
+
+def format_table(title, fields, aligns, values, sep_index=None):
+    def pad_values(v, char=' '):
+        padded = []
+        for i in range(len(fields)):
+            justified = justify_mark_text(v[i], widths[i], char, aligns[i])
+            padded.append(justified)
+        return padded
+
+    widths = [len(s) for s in fields]
+    for v in values:
+        lwidths = [mark_text_len(str(s)) for s in v]
+        widths = [max(widths[i], lwidths[i]) for i in range(len(widths))]
+
+    divider = '+-' + '-+-'.join(pad_values(['-'] * len(fields), '-')) + '-+'
+
+    # title
+    if title: print(mark_to_color(mark_text(title, 'text')))
+    print(divider)
+
+    # table header
+    colorized = [mark_to_color(c) for c in pad_values(fields)]
+    print('| ' + ' | '.join(colorized) + ' |')
+    print(divider)
+
+    # table body
+    for i, v in enumerate(values):
+        if sep_index is not None and i != 0 and values[i - 1][sep_index] != values[i][sep_index]:
+            print(divider)
+        colorized = [mark_to_color(c) for c in pad_values(v)]
+        print('| ' + ' | '.join(colorized) + ' |')
+    if len(values) == 0:
+        text = 'No data available'.ljust(len(divider) - 4)
+        print('| ' + text  + ' |')
+    print(divider)
+
+
+def format_checklist(checklist):
+    PASS = mark_text('OK', 'info')
+    FAIL = mark_text('!!', 'error')
+    NEUTRAL = mark_text('??', 'warn')
+
+    for check in checklist:
+        key = check['key']
+        passed = check['pass']
+        params = { **_get(check, 'params', {}), **{ 'storcli_path': storcli_path } }
+        item = checklist_dict[key]
+        text = item['text'].format(**params)
+        action = [f.format(**params) for f in _get(item, 'action', [])]
+
+        if passed is not True:
+            if key.startswith('T'): key = mark_text(key, 'text')
+            elif key.startswith('I'): key = mark_text(key, 'info')
+            elif key.startswith('W'): key = mark_text(key, 'warn')
+            elif key.startswith('E'): key = mark_text(key, 'error')
+            elif key.startswith('F'): key = mark_text(key, 'fatal')
+            text = mark_text(text, 'text')
+
+        if passed is True: header = PASS
+        elif passed is False: header = FAIL
+        else: header = NEUTRAL
+
+        print(f'[{mark_to_color(header)}] {mark_to_color(key)} {mark_to_color(text)}')
+        if passed: continue
+        for m in action: print(f'       # {mark_to_color(m)}')
+
+
+def format_predictive_failure(prediction):
+    if len(prediction) == 0: return
+    # @see https://slowkow.com/notes/raid-fix/
+    print(json.dumps(prediction, indent=2))
+    print('#')
+    print('# Checking disk status')
+    print('#')
+    print(f'# sudo {storcli_path} /cx show nolog                  # Show degraded virtual disks and rebuilding physical disks (**)')
+    print(f'# sudo {storcli_path} /cx/ex/sx show rebuild nolog    # Show rebuild task progress if it is configured to do so')
+    print('#')
+    print('# Relacing failed disks in array')
+    print('#')
+    print(f'# sudo {storcli_path} /cx set alarm=silence           # Stop the beeping noises')
+    print(f'# sudo {storcli_path} /cx/ex/sx start locate nolog    # Start blinking the failed disk LED')
+    print(f'# sudo {storcli_path} /cx/ex/sx set offline           # Set the failed disk offline')
+    print(f'# sudo {storcli_path} /cx/ex/sx set missing           # Set the failed disk missing')
+    print(f'# sudo {storcli_path} /cx/ex/sx set spindown          # Spin down the failed disk')
+    print('# Replace the failed disk with a new one with same model.')
+    print(f'# sudo {storcli_path} /cx/ex/sx stop locate nolog     # Stop blinking the failed disk LED')
+    print('#')
+    print('# REBUILD TASK SHOULD START AUTOMATICALLY. IF NOT, DO "Rebuilding disk array" BELOW AND COME BACK TO THE NEXT LINE.')
+    print('#')
+    print(f'# sudo {storcli_path} /cx set alarm=on                # Start the beeping noises for failure')
+    print(f'# sudo {storcli_path} /cx/ex/sx show rebuild nolog    # Monitor rebuild task progress')
+    print(f'# sudo {storcli_path} /cx show nolog                  # Show virtual disks and physical disks')
+    print('#')
+    print('# Rebuilding disk array')
+    print('# Do NOT do the following steps if rebuilding is in progress.')
+    print('#')
+    print(f'# sudo {storcli_path} /cx/ex/sx insert dg= array= row=  # Note. dg, array, row correspond to DG, Arr, Row in TOPOLOGY table in (**) above.')
+    print(f'# sudo {storcli_path} /cx/ex/sx start rebuild nolog     # Show rebuild task progress')
+    print(f'# sudo {storcli_path} /cx set autorebuild=on nolog      # Set autorebuild on for heaven\'s sake')
+
+
+###############################################################################
+# Driver
+###############################################################################
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--path', help='Specify storcli executable path.', default=None)
+    parser.add_argument('--no-color', help='Do not use color.', action='store_true', default=False)
+    parser.add_argument('--predict', help='Check if failure is predicted.', action='store_true', default=False)
+    parser.add_argument('--check', help='Check if configuration is sane.', action='store_true', default=False)
+    parser.add_argument('--event', help='Show event logs.', action='store_true', default=False)
+    parser.add_argument('--event-filters', help='Specify comma separated filters for event logs. Available filters are: info, warning, critical, fatal', default=None)
+    parser.add_argument('--event-type', help='Specify a type of event logs. Available types are: includedeleted, sinceshutdown, sincereboot, latest=N, "ccincon vd=0,1,2..."', default='latest=100')
+    args = parser.parse_args()
+    global colorize
+    colorize = not args.no_color
+    return args
+
+
+def find_storcli_executable(user_executable):
+    def executable(f): return os.path.isfile(f) and os.access(f, os.X_OK)
+
+    global storcli_path
+    if user_executable:
+        realpath = os.path.realpath(os.path.expanduser(user_executable))
+        if not os.path.isfile(realpath): return 127
+        if not os.access(realpath, os.X_OK): return 126
+        storcli_path = realpath
+        return storcli_path
+
+    script_basename = ['storcli64', 'storcli', 'perccli64', 'perccli']
+    well_known_path = ['/opt/MegaRAID/storcli', '/opt/lsi/scorcli', '/opt/MegaRAID/perccli']
+    for path in well_known_path: os.environ['PATH'] += os.pathsep + path
+    for basename in script_basename:
+        for path in os.environ['PATH'].split(os.pathsep):
+            path = path.strip('"')
+            candidate = os.path.join(path, basename)
+            if executable(candidate):
+                storcli_path = candidate
+                return storcli_path
+    return None
+
+
+if __name__ == '__main__':
+    args = parse_arguments()
+    found = find_storcli_executable(args.path)
+
+    if found is None:
+        print('Cannot find storcli executable in your PATH. Please install it.')
+        sys.exit(127)
+    elif args.path and found == 127:
+        print(f'Cannot find {args.path}. Please make sure it exists.')
+        sys.exit(127)
+    elif args.path and found == 126:
+        print(f'Cannot execute {args.path}. Please make sure it is executable.')
+        sys.exit(126)
+    if os.geteuid() != 0:
+        print(f'{storcli_path} requires administrator privileges.')
+        sys.exit(5)
+
+    # Good to go
+
+    ctrlcount = controller_count_json()
+    ctrlcount = int(_get(ctrlcount, 'Controllers.0.Response Data.Controller Count', 0))
+    if ctrlcount == 0:
+        print('Cannot find controllers.')
+        quit()
+
+    if args.check:
+        format_checklist(sanity_check())
+        quit()
+
+    if args.predict:
+        format_predictive_failure(get_predictive_failure())
+        quit()
+
+    if args.event:
+        for ctrlno in range(ctrlcount):
+            cid = f'/c{ctrlno}'
+            format_table(f'Controller {cid} event logs', **get_event_logs(cid, args.event_filters, args.event_type))
+            print('* CRITICAL=error without data loss,FATAL=error with possible data loss,FAULT=catastropic hardware failure')
+            #print('* Code: https://techdocs.broadcom.com/content/dam/broadcom/techdocs/data-center-solutions/tools/generated-pdfs/12Gbs-MegaRAID-Tri-Mode-Software.pdf')
+            print(f'# sudo {storcli_path} {cid} show events help')
+        quit()
+
+    format_table('Controllers', **get_controller_info())
+    format_table('Controller schedules', **get_controller_schedule_info())
+    format_table('Enclosures', **get_enclosure_info())
+    format_table('Virtual disks', **get_virtual_disk_info())
+    print('* R=Read Ahead Always,NR=No Read Ahead/WB=Write Back,AWB=Always Write Back,WT=Write Through/C=Cached IO,D=Direct IO')
+    format_table('Physical disks in virtual disks', **get_physical_disk_info(True), sep_index=0)
+    format_table('Physical disks not in virtual disks', **get_physical_disk_info(False))
